@@ -4,7 +4,7 @@
 
 # Apex domain with an EXISTING Route 53 public hosted zone in this
 # account. Terraform looks the zone up; it does not create it.
-domain_name = "example.com"
+domain_name = "plexis.in"
 
 # ---- Region / naming --------------------------------------------
 
