@@ -1,0 +1,28 @@
+# Brings the Compose stack back after a reboot.
+#
+# Deliberately NOT deploy.sh: a reboot should restart containers, not
+# re-run migrations or rebuild the image. Those are things you do on
+# purpose, by running deploy.sh yourself.
+#
+# The .env file deploy.sh wrote persists on disk, so `compose up`
+# has everything it needs.
+
+[Unit]
+Description=wacrm + self-hosted Supabase
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/wacrm/src/deploy/aws/stack
+ExecStart=/usr/bin/docker compose up -d
+ExecStop=/usr/bin/docker compose stop
+# RDS can take longer than Docker to become reachable after a stop /
+# start of the whole environment; the containers' own restart policy
+# retries, but give the first attempt room.
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

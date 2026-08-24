@@ -4,6 +4,45 @@ import createNextIntlPlugin from "next-intl/plugin";
 const withNextIntl = createNextIntlPlugin("./src/i18n/request.ts");
 
 /**
+ * Origins the browser is allowed to reach Supabase on.
+ *
+ * Hosted Supabase always lives under `*.supabase.co`, so the CSP used
+ * to hard-code that. A self-hosted deployment (see `deploy/aws/`)
+ * serves the same API from your own hostname, e.g.
+ * https://supabase.example.com — which the wildcard does not cover.
+ * The inbox's realtime WebSocket and every media element would be
+ * reported as a violation, and blocked outright the day this policy
+ * is switched from Report-Only to enforcing.
+ *
+ * Derived from NEXT_PUBLIC_SUPABASE_URL, which is inlined at build
+ * time. When it is unset (a bare `next build` in CI, for instance)
+ * this falls back to the hosted wildcard, so nothing changes for
+ * anyone still on supabase.com.
+ */
+function supabaseCspOrigins(): { http: string; socket: string } {
+  const hosted = { http: "https://*.supabase.co", socket: "wss://*.supabase.co" };
+  const raw = process.env.NEXT_PUBLIC_SUPABASE_URL;
+
+  if (!raw) return hosted;
+
+  let origin: string;
+  try {
+    origin = new URL(raw).origin;
+  } catch {
+    // A malformed URL here would otherwise produce a CSP that
+    // silently blocks all Supabase traffic. Fall back to the
+    // permissive value and let the app's own env handling complain.
+    return hosted;
+  }
+
+  // Realtime shares the REST host: ws: for an http origin (a local
+  // self-host over plain HTTP), wss: for https.
+  return { http: origin, socket: origin.replace(/^http/, "ws") };
+}
+
+const SUPABASE = supabaseCspOrigins();
+
+/**
  * Baseline security headers applied to every response.
  *
  * CSP ships as `Content-Security-Policy-Report-Only` so the browser
@@ -51,11 +90,11 @@ const SECURITY_HEADERS = [
       "img-src 'self' data: blob: https:",
       // Outbound media previews (blob: from MediaRecorder + file picker)
       // and Supabase public-bucket audio/video the inbox renders.
-      "media-src 'self' blob: https://*.supabase.co",
+      `media-src 'self' blob: ${SUPABASE.http}`,
       "font-src 'self' data:",
       // Supabase REST + realtime (WSS). All Meta API calls happen
       // server-side, so graph.facebook.com does not belong here.
-      "connect-src 'self' https://*.supabase.co wss://*.supabase.co",
+      `connect-src 'self' ${SUPABASE.http} ${SUPABASE.socket}`,
       "frame-ancestors 'none'",
       "base-uri 'self'",
       "form-action 'self'",

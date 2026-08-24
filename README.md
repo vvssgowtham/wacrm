@@ -93,6 +93,23 @@ Open <http://localhost:3000>. You'll be redirected to `/login` (or
 Prefer containers? See [docs/docker.md](./docs/docker.md) for the
 Dockerfile + Docker Compose setup.
 
+## Running everything on AWS (self-hosted Supabase)
+
+[`deploy/aws/`](./deploy/aws) stands up the CRM **and** its Supabase
+in your own AWS account — no supabase.com, no Hostinger. Terraform
+builds the VPC, RDS Postgres, S3, SES, ALB and Route 53 records; a
+single EC2 instance runs Kong, GoTrue, PostgREST, Realtime,
+storage-api and the app under Docker Compose.
+
+```bash
+cd deploy/aws/terraform
+cp terraform.tfvars.example terraform.tfvars   # set domain_name
+terraform init && terraform apply
+```
+
+Full runbook, cost breakdown and troubleshooting:
+**[deploy/aws/README.md](./deploy/aws/README.md)**.
+
 ## 🚀 Deploy on Hostinger (recommended)
 
 <p align="center">

@@ -1,0 +1,283 @@
+# =================================================================
+# Self-hosted Supabase + wacrm, on one EC2 instance.
+#
+# Differences from the upstream supabase/docker compose file, and why:
+#
+#   * No `db` service. Postgres is RDS. Everything the
+#     `supabase/postgres` image would have set up lives in
+#     deploy/aws/sql/000_bootstrap.sql instead — read its header
+#     before changing anything here.
+#   * No `studio` / `meta` / `analytics` / `functions` / `supavisor`.
+#     The app uses none of them, and each is another public surface
+#     to secure. Studio in particular ships with basic auth as its
+#     only protection.
+#   * No `imgproxy`. The app calls getPublicUrl() and never requests
+#     an image transformation, so storage-api's transform path is
+#     turned off rather than left running unused.
+#   * `app` service added — the Next.js CRM itself.
+#
+# All values come from ./.env, which deploy.sh generates from the
+# Terraform-supplied /etc/wacrm/deploy.env plus Secrets Manager.
+# Nothing in this file is secret; ./.env is chmod 600.
+# =================================================================
+
+name: wacrm
+
+services:
+  # ---------------------------------------------------------------
+  # Kong — the single origin NEXT_PUBLIC_SUPABASE_URL points at.
+  # Routes /auth, /rest, /realtime and /storage to the right service
+  # and enforces the anon / service_role API keys.
+  # ---------------------------------------------------------------
+  kong:
+    image: kong:${KONG_VERSION:-2.8.1}
+    restart: unless-stopped
+    ports:
+      # Cannot be bound to 127.0.0.1 — the ALB reaches this port over
+      # the VPC. The security group is what restricts it: only the
+      # ALB's security group may connect on 8000.
+      - '8000:8000/tcp'
+    environment:
+      KONG_DATABASE: 'off'
+      KONG_DECLARATIVE_CONFIG: /home/kong/kong.yml
+      # Docker's embedded DNS returns A records; LAST,A,CNAME stops
+      # Kong attempting SRV lookups that always fail and add latency
+      # to every upstream resolution.
+      KONG_DNS_ORDER: LAST,A,CNAME
+      KONG_PLUGINS: request-transformer,cors,key-auth,acl
+      # GoTrue and PostgREST both send large response headers; the
+      # 4k default makes Kong return 502 on some auth responses.
+      KONG_NGINX_PROXY_PROXY_BUFFER_SIZE: 160k
+      KONG_NGINX_PROXY_PROXY_BUFFERS: 64 160k
+      KONG_NGINX_PROXY_PROXY_BUSY_BUFFERS_SIZE: 320k
+      # Substituted into kong.yml by the entrypoint below.
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}
+    volumes:
+      - ./kong.template.yml:/home/kong/temp.yml:ro
+    # Kong's declarative config parser does not expand environment
+    # variables, so the template is expanded with `eval echo` first.
+    # This is upstream Supabase's own approach. The `$$` is Compose
+    # escaping — the container sees a single `$`.
+    entrypoint: >
+      bash -c 'eval "echo \"$$(cat ~/temp.yml)\"" > ~/kong.yml
+      && /docker-entrypoint.sh kong docker-start'
+    depends_on:
+      auth:
+        condition: service_started
+      rest:
+        condition: service_started
+      storage:
+        condition: service_started
+
+  # ---------------------------------------------------------------
+  # GoTrue — signup, login, sessions, password recovery.
+  # Owns the `auth` schema and runs its own migrations on boot.
+  # ---------------------------------------------------------------
+  auth:
+    image: supabase/gotrue:${GOTRUE_VERSION:-v2.177.0}
+    restart: unless-stopped
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: '9999'
+      # The externally reachable Supabase origin. Confirmation and
+      # recovery links are built from this, so a wrong value produces
+      # emails whose links 404.
+      API_EXTERNAL_URL: ${SUPABASE_PUBLIC_URL}
+
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${SUPABASE_AUTH_ADMIN_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
+      DB_NAMESPACE: auth
+
+      # Where users land after clicking a link in an email.
+      GOTRUE_SITE_URL: ${APP_URL}
+      GOTRUE_URI_ALLOW_LIST: ${APP_URL},${APP_URL}/**
+      GOTRUE_DISABLE_SIGNUP: ${DISABLE_SIGNUP:-false}
+
+      GOTRUE_JWT_SECRET: ${JWT_SECRET}
+      GOTRUE_JWT_EXP: '3600'
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_JWT_ADMIN_ROLES: service_role
+
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: 'true'
+      GOTRUE_EXTERNAL_PHONE_ENABLED: 'false'
+      GOTRUE_SMS_AUTOCONFIRM: 'false'
+      # See the long note on `mailer_autoconfirm` in variables.tf.
+      GOTRUE_MAILER_AUTOCONFIRM: ${MAILER_AUTOCONFIRM:-true}
+
+      GOTRUE_SMTP_HOST: ${SMTP_HOST}
+      GOTRUE_SMTP_PORT: '587'
+      GOTRUE_SMTP_USER: ${SMTP_USER}
+      GOTRUE_SMTP_PASS: ${SMTP_PASS}
+      GOTRUE_SMTP_ADMIN_EMAIL: ${SMTP_SENDER}
+      GOTRUE_SMTP_SENDER_NAME: ${SMTP_SENDER_NAME}
+      GOTRUE_SMTP_MAX_FREQUENCY: 10s
+
+      GOTRUE_MAILER_URLPATHS_INVITE: /auth/v1/verify
+      GOTRUE_MAILER_URLPATHS_CONFIRMATION: /auth/v1/verify
+      GOTRUE_MAILER_URLPATHS_RECOVERY: /auth/v1/verify
+      GOTRUE_MAILER_URLPATHS_EMAIL_CHANGE: /auth/v1/verify
+
+      GOTRUE_LOG_LEVEL: info
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'wget',
+          '--no-verbose',
+          '--tries=1',
+          '--spider',
+          'http://localhost:9999/health',
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ---------------------------------------------------------------
+  # PostgREST — the /rest/v1 API every .from() call in the app hits.
+  # Logs in as `authenticator` and SET ROLEs per request; that role
+  # is NOINHERIT for exactly that reason (see 000_bootstrap.sql).
+  # ---------------------------------------------------------------
+  rest:
+    image: postgrest/postgrest:${POSTGREST_VERSION:-v12.2.12}
+    restart: unless-stopped
+    environment:
+      PGRST_DB_URI: postgres://authenticator:${AUTHENTICATOR_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
+      # `public` only. The app reaches Storage through storage-api,
+      # never through PostgREST, so exposing the storage schema here
+      # would only widen the surface.
+      PGRST_DB_SCHEMAS: public
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: ${JWT_SECRET}
+      # `false` publishes claims as the `request.jwt.claims` GUC,
+      # which is what auth.uid() in 000_bootstrap.sql reads.
+      PGRST_DB_USE_LEGACY_GUCS: 'false'
+      # Lets `NOTIFY pgrst, 'reload schema'` (the last line of
+      # 020_post_app_grants.sql) take effect without a restart.
+      PGRST_DB_CHANNEL_ENABLED: 'true'
+      PGRST_DB_CHANNEL: pgrst
+      PGRST_DB_POOL: '20'
+    command: postgrest
+
+  # ---------------------------------------------------------------
+  # Realtime — powers the live inbox, notification bell and presence
+  # dots via postgres_changes on the supabase_realtime publication.
+  #
+  # The container_name is NOT cosmetic. Realtime derives its tenant
+  # from the first label of the Host header, Kong rewrites Host to
+  # the upstream's name, and SEED_SELF_HOST provisions a tenant
+  # called `realtime-dev`. Rename this and every subscription fails.
+  # ---------------------------------------------------------------
+  realtime:
+    image: supabase/realtime:${REALTIME_VERSION:-v2.34.47}
+    container_name: realtime-dev.supabase-realtime
+    restart: unless-stopped
+    environment:
+      PORT: '4000'
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT}
+      DB_USER: supabase_admin
+      DB_PASSWORD: ${SUPABASE_ADMIN_PASSWORD}
+      DB_NAME: ${DB_NAME}
+      # The `_realtime` schema must already exist — 000_bootstrap.sql
+      # creates it. Without it this query fails on connect and the
+      # container crash-loops with a misleading Ecto error.
+      DB_AFTER_CONNECT_QUERY: SET search_path TO _realtime
+      DB_ENC_KEY: ${DB_ENC_KEY}
+      API_JWT_SECRET: ${JWT_SECRET}
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE}
+      ERL_AFLAGS: -proto_dist inet_tcp
+      DNS_NODES: "''"
+      RLIMIT_NOFILE: '10000'
+      APP_NAME: realtime
+      SEED_SELF_HOST: 'true'
+      RUN_JANITOR: 'true'
+
+  # ---------------------------------------------------------------
+  # storage-api — the avatars / flow-media / chat-media buckets.
+  #
+  # Backed by S3. No AWS keys appear here: the AWS SDK inside the
+  # container reads the EC2 instance profile over IMDS, which is why
+  # the instance sets http_put_response_hop_limit = 2 (the Docker
+  # bridge adds a hop).
+  # ---------------------------------------------------------------
+  storage:
+    image: supabase/storage-api:${STORAGE_VERSION:-v1.25.7}
+    restart: unless-stopped
+    environment:
+      ANON_KEY: ${SUPABASE_ANON_KEY}
+      SERVICE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}
+      POSTGREST_URL: http://rest:3000
+      PGRST_JWT_SECRET: ${JWT_SECRET}
+      AUTH_JWT_SECRET: ${JWT_SECRET}
+      DATABASE_URL: postgres://supabase_storage_admin:${SUPABASE_STORAGE_ADMIN_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
+      # 000_bootstrap.sql already created every role. Letting
+      # storage-api try again fails — it is not a superuser here.
+      DB_INSTALL_ROLES: 'false'
+      # Outer gate. The per-bucket limits the app's migrations set on
+      # storage.buckets (16 MB for chat-media) are the tighter ones.
+      FILE_SIZE_LIMIT: ${STORAGE_FILE_SIZE_LIMIT:-52428800}
+
+      STORAGE_BACKEND: s3
+      STORAGE_S3_BUCKET: ${S3_BUCKET}
+      STORAGE_S3_REGION: ${AWS_REGION}
+      STORAGE_S3_FORCE_PATH_STYLE: 'false'
+      # Legacy names for the same two values. storage-api renamed
+      # these between releases and reads whichever it knows; setting
+      # both makes a version bump a non-event.
+      GLOBAL_S3_BUCKET: ${S3_BUCKET}
+      REGION: ${AWS_REGION}
+      AWS_DEFAULT_REGION: ${AWS_REGION}
+
+      TENANT_ID: stub
+      # No imgproxy in this stack — the app never requests a
+      # transformed image.
+      ENABLE_IMAGE_TRANSFORMATION: 'false'
+    depends_on:
+      rest:
+        condition: service_started
+
+  # ---------------------------------------------------------------
+  # The CRM.
+  #
+  # Built on the box. NEXT_PUBLIC_* values are inlined into the
+  # client bundle at build time, so changing SUPABASE_PUBLIC_URL or
+  # APP_URL requires `deploy.sh --rebuild`, not just a restart.
+  # ---------------------------------------------------------------
+  app:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_SUPABASE_URL: ${SUPABASE_PUBLIC_URL}
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
+        NEXT_PUBLIC_SITE_URL: ${APP_URL}
+        NEXT_PUBLIC_APP_LOCALE: ${APP_LOCALE:-en}
+    restart: unless-stopped
+    ports:
+      - '3000:3000'
+    environment:
+      NODE_ENV: production
+      PORT: '3000'
+      HOSTNAME: 0.0.0.0
+
+      # Re-declared at runtime as well as at build time. Server
+      # components and route handlers read these at request time.
+      NEXT_PUBLIC_SUPABASE_URL: ${SUPABASE_PUBLIC_URL}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
+      NEXT_PUBLIC_SITE_URL: ${APP_URL}
+      NEXT_PUBLIC_APP_LOCALE: ${APP_LOCALE:-en}
+
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      META_APP_SECRET: ${META_APP_SECRET}
+      META_APP_ID: ${META_APP_ID}
+      AUTOMATION_CRON_SECRET: ${AUTOMATION_CRON_SECRET}
+      # Defence in depth for invite links: reject a spoofed Host
+      # header rather than minting an invite URL pointing at it.
+      ALLOWED_INVITE_HOSTS: ${APP_FQDN}
+    depends_on:
+      kong:
+        condition: service_started

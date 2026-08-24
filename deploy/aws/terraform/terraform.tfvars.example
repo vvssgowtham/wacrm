@@ -1,0 +1,61 @@
+# Copy to terraform.tfvars and edit. terraform.tfvars is gitignored.
+
+# ---- Required ---------------------------------------------------
+
+# Apex domain with an EXISTING Route 53 public hosted zone in this
+# account. Terraform looks the zone up; it does not create it.
+domain_name = "example.com"
+
+# ---- Region / naming --------------------------------------------
+
+aws_region   = "ap-south-1"
+project_name = "wacrm"
+environment  = "prod"
+
+# The CRM is served at https://crm.example.com
+# Self-hosted Supabase at https://supabase.example.com
+app_subdomain      = "crm"
+supabase_subdomain = "supabase"
+
+# ---- Your fork ---------------------------------------------------
+
+app_repo_url    = "https://github.com/ajaychanumolu/wacrm.git"
+app_repo_branch = "main"
+
+# ---- Sizing ------------------------------------------------------
+
+# t3.medium is the floor (next build runs on the box). t3.large if
+# builds feel slow or you expect real traffic.
+instance_type    = "t3.medium"
+root_volume_size = 50
+
+db_instance_class        = "db.t4g.small"
+db_allocated_storage     = 20
+db_backup_retention_days = 7
+db_multi_az              = false
+db_deletion_protection   = true
+
+# ---- Email -------------------------------------------------------
+
+# Leave empty to skip SES entirely (no password-recovery mail).
+# Must be an address on domain_name.
+ses_from_address = "no-reply@example.com"
+ses_sender_name  = "Your Company CRM"
+
+# Set to false if the apex already has a TXT record.
+manage_spf_record = true
+
+# ---- Auth behaviour ----------------------------------------------
+
+# See the long note in variables.tf. Leave true until someone adds an
+# /auth/callback route to the app.
+mailer_autoconfirm = true
+
+# Flip to true and re-apply once your owner account exists.
+disable_signup = false
+
+# ---- Access ------------------------------------------------------
+
+# Leave empty and use `aws ssm start-session` instead of SSH.
+admin_cidr_blocks = []
+key_pair_name     = ""

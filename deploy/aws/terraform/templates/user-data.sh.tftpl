@@ -1,0 +1,131 @@
+#!/bin/bash
+# =================================================================
+# First-boot bootstrap.
+#
+# This file is a Terraform template, so `$${...}` is a shell variable
+# and `${...}` is a Terraform value. It is kept deliberately short for
+# exactly that reason — all the real logic lives in
+# deploy/aws/scripts/deploy.sh, which is a plain shell script in the
+# repo that you can re-run by hand as many times as you like.
+# =================================================================
+set -euxo pipefail
+
+exec > >(tee -a /var/log/wacrm-bootstrap.log) 2>&1
+
+# -----------------------------------------------------------------
+# Swap. `next build` peaks well past 2 GB and a t3.medium has 4 GB
+# total with the Supabase containers already resident. Without swap
+# the build gets OOM-killed and the deploy fails with a misleading
+# "exit code 137".
+# -----------------------------------------------------------------
+if [ ! -f /swapfile ]; then
+  dd if=/dev/zero of=/swapfile bs=1M count=4096
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+
+# -----------------------------------------------------------------
+# Packages
+# -----------------------------------------------------------------
+dnf update -y
+dnf install -y docker git jq openssl tar gzip amazon-cloudwatch-agent || dnf install -y docker git jq openssl tar gzip
+
+# psql, used to apply the bootstrap SQL and the app's migrations.
+# AL2023 ships different major versions over time; any client >= 15
+# speaks the wire protocol a PG17 server expects.
+dnf install -y postgresql17 || dnf install -y postgresql16 || dnf install -y postgresql15
+
+systemctl enable --now docker
+
+# The Compose plugin is not packaged for AL2023. Pinned rather than
+# `latest` so a rebuild six months from now behaves identically.
+COMPOSE_VERSION=v2.29.7
+mkdir -p /usr/libexec/docker/cli-plugins
+curl -fsSL \
+  "https://github.com/docker/compose/releases/download/$${COMPOSE_VERSION}/docker-compose-linux-x86_64" \
+  -o /usr/libexec/docker/cli-plugins/docker-compose
+chmod +x /usr/libexec/docker/cli-plugins/docker-compose
+
+# -----------------------------------------------------------------
+# Deploy-time configuration.
+#
+# Only non-secret, infrastructure-derived values live here. Every
+# secret is pulled from Secrets Manager at deploy time by deploy.sh
+# using the instance profile.
+# -----------------------------------------------------------------
+mkdir -p /etc/wacrm /opt/wacrm
+
+cat > /etc/wacrm/deploy.env <<'DEPLOYENV'
+AWS_REGION=${aws_region}
+SECRET_ID=${secret_id}
+REPO_URL=${repo_url}
+REPO_BRANCH=${repo_branch}
+DB_HOST=${db_host}
+DB_PORT=${db_port}
+DB_NAME=${db_name}
+S3_BUCKET=${s3_bucket}
+APP_URL=${app_url}
+SUPABASE_PUBLIC_URL=${supabase_url}
+APP_FQDN=${app_fqdn}
+APP_LOCALE=${app_locale}
+SMTP_HOST=${smtp_host}
+SMTP_SENDER=${smtp_sender}
+SMTP_SENDER_NAME=${smtp_name}
+MAILER_AUTOCONFIRM=${autoconfirm}
+DISABLE_SIGNUP=${disable_signup}
+STORAGE_FILE_SIZE_LIMIT=${file_size_limit}
+DEPLOYENV
+
+chmod 0644 /etc/wacrm/deploy.env
+
+# -----------------------------------------------------------------
+# CloudWatch log shipping (best effort — a missing agent must not
+# fail the boot, it only makes debugging harder).
+# -----------------------------------------------------------------
+if command -v amazon-cloudwatch-agent-ctl >/dev/null 2>&1; then
+  cat > /opt/aws/amazon-cloudwatch-agent/etc/wacrm.json <<'CWEOF'
+{
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/wacrm-bootstrap.log",
+            "log_group_name": "${log_group}",
+            "log_stream_name": "{instance_id}/bootstrap"
+          },
+          {
+            "file_path": "/var/log/wacrm-deploy.log",
+            "log_group_name": "${log_group}",
+            "log_stream_name": "{instance_id}/deploy"
+          }
+        ]
+      }
+    }
+  }
+}
+CWEOF
+  amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s \
+    -c file:/opt/aws/amazon-cloudwatch-agent/etc/wacrm.json || true
+fi
+
+# -----------------------------------------------------------------
+# Source + first deploy
+# -----------------------------------------------------------------
+if [ ! -d /opt/wacrm/src/.git ]; then
+  git clone --branch "${repo_branch}" "${repo_url}" /opt/wacrm/src
+fi
+
+chmod +x /opt/wacrm/src/deploy/aws/scripts/*.sh
+
+# Brings the Compose stack back up after a reboot without re-running
+# migrations or rebuilding the image.
+install -m 0644 /opt/wacrm/src/deploy/aws/scripts/wacrm.service /etc/systemd/system/wacrm.service
+systemctl daemon-reload
+systemctl enable wacrm.service
+
+/opt/wacrm/src/deploy/aws/scripts/deploy.sh
+
+echo "bootstrap complete"

@@ -42,3 +42,16 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# AWS deployment (deploy/aws)
+# Terraform state contains every generated secret in plaintext, and
+# tfvars carries your domain and account-specific settings.
+deploy/aws/terraform/.terraform/
+deploy/aws/terraform/.terraform.lock.hcl
+deploy/aws/terraform/terraform.tfstate
+deploy/aws/terraform/terraform.tfstate.*
+deploy/aws/terraform/*.tfvars
+!deploy/aws/terraform/*.tfvars.example
+deploy/aws/terraform/tfplan
+# Generated on the instance by deploy.sh from Secrets Manager.
+deploy/aws/stack/.env
