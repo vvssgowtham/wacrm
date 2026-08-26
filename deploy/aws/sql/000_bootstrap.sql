@@ -201,6 +201,25 @@ GRANT USAGE ON SCHEMA auth    TO postgres, anon, authenticated, service_role;
 GRANT USAGE ON SCHEMA storage TO postgres, anon, authenticated, service_role;
 GRANT USAGE ON SCHEMA public  TO postgres, anon, authenticated, service_role;
 
+-- GoTrue and storage-api need CREATE on `public`, not just USAGE.
+--
+-- Both keep their real tables in their own schema (DB_NAMESPACE=auth,
+-- and storage-api's equivalent), but their migrators create a
+-- bookkeeping table — `schema_migrations` — with an UNQUALIFIED name.
+-- That resolves through search_path to `public`.
+--
+-- Since PostgreSQL 15 the `public` schema is owned by
+-- `pg_database_owner` and no longer grants CREATE to PUBLIC, so the
+-- service roles are refused:
+--
+--   running db migrations: ... could not execute
+--   CREATE TABLE "schema_migrations" ...
+--   ERROR: permission denied for schema public (SQLSTATE 42501)
+--
+-- GoTrue then crash-loops, auth.users is never created, and deploy.sh
+-- fails at step [2/5] waiting for a table that cannot appear.
+GRANT USAGE, CREATE ON SCHEMA public TO supabase_auth_admin, supabase_storage_admin;
+
 -- -----------------------------------------------------------------
 -- auth.uid() and friends
 --
