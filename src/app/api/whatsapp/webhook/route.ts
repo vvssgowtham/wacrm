@@ -1,5 +1,6 @@
 import { NextResponse, after } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
+import { supabaseApiUrl } from '@/lib/supabase/api-url'
 import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption'
 import { getMediaUrl, downloadMedia } from '@/lib/whatsapp/meta-api'
 import { mirrorInboundMedia } from '@/lib/whatsapp/mirror-inbound-media'
@@ -28,7 +29,7 @@ let _adminClient: any = null
 function supabaseAdmin() {
   if (!_adminClient) {
     _adminClient = createClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      supabaseApiUrl(),
       process.env.SUPABASE_SERVICE_ROLE_KEY!
     )
   }

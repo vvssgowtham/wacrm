@@ -279,6 +279,8 @@ services:
         NEXT_PUBLIC_SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
         NEXT_PUBLIC_SITE_URL: ${APP_URL}
         NEXT_PUBLIC_APP_LOCALE: ${APP_LOCALE:-en}
+        # See the runtime copy below for why this exists.
+        SUPABASE_INTERNAL_URL: http://kong:8000
     restart: unless-stopped
     ports:
       - '3000:3000'
@@ -291,6 +293,23 @@ services:
       NEXT_PUBLIC_SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
       NEXT_PUBLIC_SITE_URL: ${APP_URL}
       NEXT_PUBLIC_APP_LOCALE: ${APP_LOCALE:-en}
+
+      # The browser and the server reach Supabase at DIFFERENT
+      # addresses here, and the app has to be told so.
+      #
+      # NEXT_PUBLIC_SUPABASE_URL is this machine's public address —
+      # correct for the browser, unreachable from inside this
+      # container: an EC2 instance does not route traffic to its own
+      # Elastic IP, it sends it to the internet gateway and it is
+      # dropped. (doctor.sh reports exactly this, as `000` against the
+      # public URLs.)
+      #
+      # Without this, login LOOKS broken in a way that points nowhere:
+      # the browser authenticates fine, then middleware.ts calls
+      # auth.getUser(), the request never lands, user is null, and it
+      # redirects to /login — an empty login form and no error in any
+      # log. See src/lib/supabase/api-url.ts.
+      SUPABASE_INTERNAL_URL: http://kong:8000
 
       SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY}

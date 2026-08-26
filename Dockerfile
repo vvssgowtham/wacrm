@@ -26,10 +26,22 @@ ARG NEXT_PUBLIC_SUPABASE_URL
 ARG NEXT_PUBLIC_SUPABASE_ANON_KEY
 ARG NEXT_PUBLIC_SITE_URL
 ARG NEXT_PUBLIC_APP_LOCALE=en
+
+# Optional. The Supabase origin SERVER-side code should call, when it
+# differs from the browser's — a single-box self-host where the app
+# container cannot reach the machine's own public address. See
+# src/lib/supabase/api-url.ts. Passed at build time as well as run
+# time because middleware may be bundled for the Edge runtime, which
+# inlines process.env at build rather than reading it at request time.
+# Empty here means "same as NEXT_PUBLIC_SUPABASE_URL", which is what
+# hosted Supabase and the deploy/aws/ stack both want.
+ARG SUPABASE_INTERNAL_URL
+
 ENV NEXT_PUBLIC_SUPABASE_URL=$NEXT_PUBLIC_SUPABASE_URL \
     NEXT_PUBLIC_SUPABASE_ANON_KEY=$NEXT_PUBLIC_SUPABASE_ANON_KEY \
     NEXT_PUBLIC_SITE_URL=$NEXT_PUBLIC_SITE_URL \
     NEXT_PUBLIC_APP_LOCALE=$NEXT_PUBLIC_APP_LOCALE \
+    SUPABASE_INTERNAL_URL=$SUPABASE_INTERNAL_URL \
     NEXT_TELEMETRY_DISABLED=1
 
 RUN npm run build
