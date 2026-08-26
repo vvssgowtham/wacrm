@@ -81,7 +81,9 @@ echo "Realtime publication"
 echo "--------------------"
 check "logical replication enabled on the instance" \
   "SELECT current_setting('wal_level') = 'logical'"
-for table in messages conversations notifications member_presence flows; do
+# flow_runs, not flows. `flows` is the flow definition — configuration
+# that never streams. 010_flows.sql:278 publishes flow_runs.
+for table in messages conversations notifications member_presence flow_runs; do
   check "$table in supabase_realtime" \
     "SELECT EXISTS (SELECT FROM pg_publication_tables
                     WHERE pubname='supabase_realtime' AND tablename='$table')"

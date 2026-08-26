@@ -95,7 +95,10 @@ echo "Realtime publication"
 echo "--------------------"
 check "logical replication enabled on the instance" \
   "SELECT current_setting('wal_level') = 'logical'"
-for table in messages conversations notifications member_presence flows; do
+# flow_runs, not flows. `flows` is the flow definition — configuration
+# that never streams. 010_flows.sql:278 publishes flow_runs, the
+# per-contact execution rows the UI watches.
+for table in messages conversations notifications member_presence flow_runs; do
   check "$table in supabase_realtime" \
     "SELECT EXISTS (SELECT FROM pg_publication_tables
                     WHERE pubname='supabase_realtime' AND tablename='$table')"
@@ -103,8 +106,16 @@ done
 slots="$("${PSQL[@]}" -c "SELECT count(*) FROM pg_replication_slots WHERE active")"
 if [ "${slots:-0}" -ge 1 ]; then
   ok "$slots active replication slot(s) — Realtime is consuming the WAL"
+elif [ "$(docker compose --project-directory "$STACK_DIR" ps -q realtime 2>/dev/null)" = "" ]; then
+  bad "no active replication slot and the realtime container is not running"
 else
-  bad "no active replication slot — Realtime is not consuming the WAL; check 'docker compose logs realtime'"
+  # Realtime opens its replication connection lazily — on the first
+  # channel subscription, not at startup. On a fresh deploy with
+  # nobody logged in there is legitimately no slot yet, so this is
+  # only a failure once someone has actually used the app.
+  warn "no active replication slot yet — expected if no browser has"
+  warn "  opened the app since realtime started. Log in, then re-run"
+  warn "  this check. If it is still empty: docker compose logs realtime"
 fi
 
 unset PGPASSWORD
