@@ -77,6 +77,9 @@ STACK_DIR="$SRC_DIR/deploy/selfhost"
 # The bootstrap and grant SQL is shared with the AWS deployment and
 # needs no changes — it was written against a vanilla Postgres.
 SQL_DIR="$SRC_DIR/deploy/aws/sql"
+# Container-only privileges that the shared, RDS-targeted bootstrap
+# cannot grant.
+SELFHOST_SQL_DIR="$SRC_DIR/deploy/selfhost/sql"
 SCRIPTS_DIR="$SRC_DIR/deploy/selfhost"
 # gen-jwt.sh is likewise unchanged.
 AWS_SCRIPTS_DIR="$SRC_DIR/deploy/aws/scripts"
@@ -296,6 +299,15 @@ if [ "$SKIP_MIGRATIONS" -eq 0 ]; then
     --set "storage_admin_password=$SUPABASE_STORAGE_ADMIN_PASSWORD" \
     --set "supabase_admin_password=$SUPABASE_ADMIN_PASSWORD" \
     --file "$SQL_DIR/000_bootstrap.sql"
+
+  # 000_bootstrap.sql targets RDS, where the master user is not a
+  # superuser and several grants are simply unavailable. Postgres in a
+  # container has no such ceiling — this closes the gap, and without
+  # it storage-api, GoTrue and Realtime all crash-loop on privilege
+  # errors. See the file header.
+  echo "--- [1/5] container privileges (superuser, database-level grants)"
+  "${PSQL[@]}" --set ON_ERROR_STOP=1 \
+    --file "$SELFHOST_SQL_DIR/001_container_privileges.sql"
 fi
 
 # =================================================================
