@@ -165,8 +165,13 @@ fi
 # derived from JWT_SECRET, so they only change if that changes.
 # -----------------------------------------------------------------
 echo "--- minting anon and service_role keys"
-SUPABASE_ANON_KEY="$("$AWS_SCRIPTS_DIR/gen-jwt.sh" "$JWT_SECRET" anon)"
-SUPABASE_SERVICE_ROLE_KEY="$("$AWS_SCRIPTS_DIR/gen-jwt.sh" "$JWT_SECRET" service_role)"
+# Invoked via `bash` rather than executed directly: --update runs
+# `git reset --hard`, which restores each file's recorded mode. If the
+# exec bit is ever missing from the index, executing this directly
+# fails with "Permission denied" halfway through a deploy. Calling the
+# interpreter needs only read permission, so the mode cannot break it.
+SUPABASE_ANON_KEY="$(bash "$AWS_SCRIPTS_DIR/gen-jwt.sh" "$JWT_SECRET" anon)"
+SUPABASE_SERVICE_ROLE_KEY="$(bash "$AWS_SCRIPTS_DIR/gen-jwt.sh" "$JWT_SECRET" service_role)"
 
 # -----------------------------------------------------------------
 # Compose environment file.
