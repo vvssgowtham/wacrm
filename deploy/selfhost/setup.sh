@@ -177,7 +177,7 @@ if [ ! -f "$SECRETS_FILE" ]; then
   "SUPABASE_AUTH_ADMIN_PASSWORD":     "$(openssl rand -hex 16)",
   "SUPABASE_STORAGE_ADMIN_PASSWORD":  "$(openssl rand -hex 16)",
   "SUPABASE_ADMIN_PASSWORD":          "$(openssl rand -hex 16)",
-  "DB_ENC_KEY":                       "$(openssl rand -hex 16)",
+  "DB_ENC_KEY":                       "$(openssl rand -hex 8)",
   "JWT_SECRET":                       "$(openssl rand -hex 32)",
   "SECRET_KEY_BASE":                  "$(openssl rand -hex 32)",
   "ENCRYPTION_KEY":                   "$(openssl rand -hex 32)",
@@ -194,7 +194,7 @@ else
   # Top up anything a newer version of this script expects but an
   # older run did not create. Never overwrites.
   for key in POSTGRES_PASSWORD AUTHENTICATOR_PASSWORD SUPABASE_AUTH_ADMIN_PASSWORD \
-             SUPABASE_STORAGE_ADMIN_PASSWORD SUPABASE_ADMIN_PASSWORD DB_ENC_KEY; do
+             SUPABASE_STORAGE_ADMIN_PASSWORD SUPABASE_ADMIN_PASSWORD; do
     if [ -z "$(jq -r --arg k "$key" '.[$k] // ""' "$SECRETS_FILE")" ]; then
       echo "    adding missing $key"
       tmp="$(mktemp)"
@@ -210,6 +210,25 @@ else
       mv "$tmp" "$SECRETS_FILE"
     fi
   done
+
+  # DB_ENC_KEY is repaired, not merely topped up.
+  #
+  # Realtime uses it as an AES-128 key, so it must be EXACTLY 16
+  # characters. An earlier version of this script generated it with
+  # `openssl rand -hex 16` — 32 characters — and Realtime crash-looped
+  # on every start.
+  #
+  # Rewriting it is safe: the key only encrypts tenant rows in the
+  # `_realtime` schema, and a Realtime that never started has never
+  # written any. It is NOT safe to treat ENCRYPTION_KEY this way,
+  # which is why that one is only ever topped up when absent.
+  enc="$(jq -r '.DB_ENC_KEY // ""' "$SECRETS_FILE")"
+  if [ "${#enc}" -ne 16 ]; then
+    echo "    DB_ENC_KEY is ${#enc} chars, must be exactly 16 — regenerating"
+    tmp="$(mktemp)"
+    jq --arg v "$(openssl rand -hex 8)" '.DB_ENC_KEY = $v' "$SECRETS_FILE" > "$tmp"
+    mv "$tmp" "$SECRETS_FILE"
+  fi
 fi
 chmod 600 "$SECRETS_FILE"
 

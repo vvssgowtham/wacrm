@@ -150,6 +150,30 @@ if [ -z "$POSTGRES_PASSWORD" ]; then
   exit 1
 fi
 
+# Realtime uses DB_ENC_KEY as an AES-128 key: exactly 16 characters,
+# no more, no less. Any other length and the container crash-loops on
+# every start while the rest of the stack comes up fine — so the
+# deploy "succeeds" and the live inbox silently never updates.
+if [ "${#DB_ENC_KEY}" -ne 16 ]; then
+  cat >&2 <<ENCERR
+
+FATAL: DB_ENC_KEY is ${#DB_ENC_KEY} characters, must be exactly 16.
+
+Realtime uses it as an AES-128 key. Repair it with:
+
+  sudo bash -c 'tmp=\$(mktemp); jq --arg v "\$(openssl rand -hex 8)" \\
+    ".DB_ENC_KEY = \\\$v" /etc/wacrm/secrets.json > "\$tmp" \\
+    && mv "\$tmp" /etc/wacrm/secrets.json \\
+    && chmod 600 /etc/wacrm/secrets.json'
+
+Safe to regenerate: this key only encrypts tenant rows in the
+_realtime schema, which a Realtime that never started has not
+written. Then re-run this script.
+
+ENCERR
+  exit 1
+fi
+
 if [ -z "$META_APP_SECRET" ]; then
   echo
   echo "  NOTE: META_APP_SECRET is empty. The app will start, but"
