@@ -53,6 +53,54 @@ exec > >(tee -a /var/log/wacrm-bootstrap.log) 2>&1
 echo "=== setup.sh starting at $(date -u +%FT%TZ) for $PUBLIC_IP ==="
 
 # -----------------------------------------------------------------
+# Disk.
+#
+# Checked BEFORE the swapfile, because writing 6 GB onto an 8 GB root
+# volume is how this fails otherwise: the swapfile succeeds, then
+# `dnf install docker` dies with "needs 198MB more space" and the
+# real cause (the volume was never resized past the 8 GB default)
+# is two steps back in the log.
+#
+# The budget: 6 GB swap + ~8 GB of container images + ~10 GB of
+# Next.js build cache, plus room for the nightly backups.
+# -----------------------------------------------------------------
+REQUIRED_GB=30
+avail_gb=$(($(df -Pk / | awk 'NR==2 {print $4}') / 1024 / 1024))
+
+if [ "$avail_gb" -lt "$REQUIRED_GB" ]; then
+  cat >&2 <<DISKERR
+
+FATAL: only ${avail_gb} GB free on / — this needs at least ${REQUIRED_GB} GB.
+
+The root volume is almost certainly still the 8 GB default; the
+launch wizard's storage field is easy to miss. Nothing is broken,
+you just need a bigger disk. It can be grown while the instance
+runs:
+
+  1. EC2 console -> Elastic Block Store -> Volumes
+     Select this instance's volume -> Actions -> Modify volume
+     Size: 50 -> Modify. Wait for state "in-use - optimizing".
+
+  2. Back here, grow the partition and filesystem onto the new space:
+
+       lsblk
+       sudo growpart /dev/nvme0n1 1
+       sudo xfs_growfs -d /
+       df -h /
+
+  3. Re-run this script. It is idempotent — anything already done
+     (the swapfile, any installed package) is skipped.
+
+If /swapfile already exists and you need room to breathe first:
+
+       sudo swapoff /swapfile && sudo rm -f /swapfile
+
+DISKERR
+  exit 1
+fi
+echo "--- disk: ${avail_gb} GB free on / (need ${REQUIRED_GB})"
+
+# -----------------------------------------------------------------
 # Swap.
 #
 # `next build` peaks well past 2 GB. A t3.medium has 4 GB total, and
