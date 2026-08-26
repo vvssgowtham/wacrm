@@ -100,6 +100,34 @@ ALTER ROLE supabase_auth_admin    WITH PASSWORD :'auth_admin_password';
 ALTER ROLE supabase_storage_admin WITH PASSWORD :'storage_admin_password';
 ALTER ROLE supabase_admin         WITH PASSWORD :'supabase_admin_password';
 
+-- Pin each service role's search_path to the schema it owns.
+--
+-- This is NOT cosmetic, and leaving it out breaks GoTrue in a way
+-- that takes a long time to diagnose. Its migrations are inconsistent
+-- about qualifying names. 20220615000000_add_mfa_schema creates the
+-- enum UNQUALIFIED:
+--
+--   create type factor_type as enum('totp', 'webauthn');
+--
+-- while 20240729123726_add_mfa_phone_config, added two years later,
+-- refers to it QUALIFIED:
+--
+--   alter type auth.factor_type add value 'phone';
+--
+-- With the default search_path ("$user", public) the first statement
+-- puts the type in `public`, so the second fails with
+--
+--   ERROR: type "auth.factor_type" does not exist (SQLSTATE 42704)
+--
+-- and GoTrue crash-loops forever on a database that otherwise looks
+-- perfectly healthy. The same mechanism sends its `schema_migrations`
+-- bookkeeping table to `public` instead of `auth`.
+--
+-- The supabase/postgres image sets this; a plain Postgres does not.
+-- storage-api has the same pattern against its own schema.
+ALTER ROLE supabase_auth_admin    SET search_path = auth;
+ALTER ROLE supabase_storage_admin SET search_path = storage;
+
 -- BYPASSRLS on service_role.
 --
 -- This is the single most important line in the file and the one most
