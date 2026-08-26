@@ -326,6 +326,27 @@ both. Then `sudo docker compose logs realtime`. Do not rename the
 `realtime` container: it derives its tenant from the Host header, and
 `container_name: realtime-dev.supabase-realtime` is load-bearing.
 
+**GoTrue crash-loops on a migration, e.g. `type "auth.factor_type"
+does not exist` (SQLSTATE 42704).** Its bookkeeping and the actual
+`auth` schema have fallen out of sync — some migrations are recorded
+as applied but their objects were never created. This is what a run
+that failed *partway* through GoTrue's migrations leaves behind,
+usually after an earlier privilege problem.
+
+There is no partial repair worth attempting: hand-creating the
+missing object just moves the failure to the next migration. Rebuild
+the database instead. **Only do this before you have real data** —
+after that, restore from `backup.sh` rather than wiping:
+
+```bash
+cd /opt/wacrm/src/deploy/selfhost
+sudo docker compose down -v      # removes db-data AND storage-data
+sudo ./deploy.sh --update
+```
+
+`deploy.sh` applies every privilege before any service starts, so a
+clean run does not reproduce the split state.
+
 **Migration 001 fails with "relation auth.users does not exist".** The
 app migrations ran before GoTrue created its schema. `deploy.sh`
 orders this correctly; if you ran the SQL by hand, re-run
