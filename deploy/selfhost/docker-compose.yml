@@ -1,0 +1,307 @@
+# =================================================================
+# Self-hosted Supabase + wacrm on ONE EC2 instance, reachable by IP.
+#
+# Adapted from deploy/aws/stack/docker-compose.yml. Read that file's
+# header first — the reasoning behind Kong's buffer sizes, realtime's
+# container_name and the absent studio/meta/analytics services is
+# unchanged and not repeated here.
+#
+# What differs from the AWS stack, and why:
+#
+#   * A `db` service. The AWS stack points at RDS; here Postgres runs
+#     on the box. The image is pgvector/pgvector:pg17 rather than
+#     plain postgres:17 because migration 030 does
+#     `CREATE EXTENSION vector`. Everything else the supabase/postgres
+#     image would have set up still comes from
+#     deploy/aws/sql/000_bootstrap.sql, which is written against a
+#     vanilla Postgres and needs no changes.
+#   * Storage writes to a local volume instead of S3. No bucket, no
+#     IAM instance profile, no credentials. The three *Supabase*
+#     buckets (avatars, flow-media, chat-media) are unaffected — they
+#     are rows in storage.buckets either way.
+#   * No SMTP. Without a domain there is no SES identity to send from,
+#     so GOTRUE_SMTP_* is omitted entirely and MAILER_AUTOCONFIRM
+#     carries signup instead.
+#
+# All values come from ./.env, which deploy.sh generates from
+# /etc/wacrm/deploy.env plus /etc/wacrm/secrets.json. Nothing in this
+# file is secret; ./.env is chmod 600.
+# =================================================================
+
+name: wacrm
+
+services:
+  # ---------------------------------------------------------------
+  # Postgres.
+  #
+  # Published on 127.0.0.1 ONLY. deploy.sh, doctor.sh and backup.sh
+  # all run psql from the host, and the host cannot resolve the
+  # compose service name `db`. Loopback keeps the port off the
+  # instance's public interface regardless of the security group.
+  #
+  # wal_level=logical is what RDS got from a parameter group. Without
+  # it Realtime connects, reports no error, and silently delivers no
+  # postgres_changes events — the live inbox just never updates.
+  # ---------------------------------------------------------------
+  db:
+    image: ${POSTGRES_IMAGE:-pgvector/pgvector:pg17}
+    restart: unless-stopped
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=20
+      - -c
+      - max_wal_senders=20
+      - -c
+      - max_connections=200
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${DB_NAME:-postgres}
+      # C.UTF-8 rather than the image's default C locale: text
+      # comparison and full-text search (the AI knowledge base,
+      # migration 030) behave differently under byte-order collation.
+      POSTGRES_INITDB_ARGS: '--encoding=UTF8 --locale=C.UTF-8'
+    ports:
+      - '127.0.0.1:5432:5432'
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d ${DB_NAME:-postgres}']
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    stop_grace_period: 60s
+
+  # ---------------------------------------------------------------
+  # Kong — the single origin NEXT_PUBLIC_SUPABASE_URL points at.
+  # ---------------------------------------------------------------
+  kong:
+    image: kong:${KONG_VERSION:-2.8.1}
+    restart: unless-stopped
+    ports:
+      # Bound to all interfaces on purpose: the BROWSER talks to Kong
+      # directly, it is not proxied through the app. The security
+      # group is what restricts who may reach it. Closing this port
+      # leaves the login page loading and nothing on it working.
+      - '8000:8000/tcp'
+    environment:
+      KONG_DATABASE: 'off'
+      KONG_DECLARATIVE_CONFIG: /home/kong/kong.yml
+      KONG_DNS_ORDER: LAST,A,CNAME
+      KONG_PLUGINS: request-transformer,cors,key-auth,acl
+      KONG_NGINX_PROXY_PROXY_BUFFER_SIZE: 160k
+      KONG_NGINX_PROXY_PROXY_BUFFERS: 64 160k
+      KONG_NGINX_PROXY_PROXY_BUSY_BUFFERS_SIZE: 320k
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}
+    volumes:
+      - ./kong.template.yml:/home/kong/temp.yml:ro
+    entrypoint: >
+      bash -c 'eval "echo \"$$(cat ~/temp.yml)\"" > ~/kong.yml
+      && /docker-entrypoint.sh kong docker-start'
+    depends_on:
+      auth:
+        condition: service_started
+      rest:
+        condition: service_started
+      storage:
+        condition: service_started
+
+  # ---------------------------------------------------------------
+  # GoTrue — signup, login, sessions.
+  #
+  # No SMTP block here (see the file header). With
+  # GOTRUE_MAILER_AUTOCONFIRM=true, signup completes without an email
+  # round-trip. Password recovery dead-ends regardless: the app has no
+  # /auth/callback route and no /reset-password page. That is an
+  # upstream gap, not something this deployment introduces.
+  # ---------------------------------------------------------------
+  auth:
+    image: supabase/gotrue:${GOTRUE_VERSION:-v2.177.0}
+    restart: unless-stopped
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: '9999'
+      API_EXTERNAL_URL: ${SUPABASE_PUBLIC_URL}
+
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${SUPABASE_AUTH_ADMIN_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
+      DB_NAMESPACE: auth
+
+      GOTRUE_SITE_URL: ${APP_URL}
+      GOTRUE_URI_ALLOW_LIST: ${APP_URL},${APP_URL}/**
+      GOTRUE_DISABLE_SIGNUP: ${DISABLE_SIGNUP:-false}
+
+      GOTRUE_JWT_SECRET: ${JWT_SECRET}
+      GOTRUE_JWT_EXP: '3600'
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_JWT_ADMIN_ROLES: service_role
+
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: 'true'
+      GOTRUE_EXTERNAL_PHONE_ENABLED: 'false'
+      GOTRUE_SMS_AUTOCONFIRM: 'false'
+      GOTRUE_MAILER_AUTOCONFIRM: ${MAILER_AUTOCONFIRM:-true}
+
+      GOTRUE_LOG_LEVEL: info
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'wget',
+          '--no-verbose',
+          '--tries=1',
+          '--spider',
+          'http://localhost:9999/health',
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------
+  # PostgREST — the /rest/v1 API every .from() call in the app hits.
+  # ---------------------------------------------------------------
+  rest:
+    image: postgrest/postgrest:${POSTGREST_VERSION:-v12.2.12}
+    restart: unless-stopped
+    environment:
+      PGRST_DB_URI: postgres://authenticator:${AUTHENTICATOR_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
+      PGRST_DB_SCHEMAS: public
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: ${JWT_SECRET}
+      PGRST_DB_USE_LEGACY_GUCS: 'false'
+      PGRST_DB_CHANNEL_ENABLED: 'true'
+      PGRST_DB_CHANNEL: pgrst
+      PGRST_DB_POOL: '20'
+    command: postgrest
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------
+  # Realtime — live inbox, notification bell, presence dots.
+  #
+  # container_name is load-bearing. Realtime derives its tenant from
+  # the first label of the Host header, Kong rewrites Host to the
+  # upstream's name, and SEED_SELF_HOST provisions a tenant called
+  # `realtime-dev`. Rename this and every subscription fails.
+  # ---------------------------------------------------------------
+  realtime:
+    image: supabase/realtime:${REALTIME_VERSION:-v2.34.47}
+    container_name: realtime-dev.supabase-realtime
+    restart: unless-stopped
+    environment:
+      PORT: '4000'
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT}
+      DB_USER: supabase_admin
+      DB_PASSWORD: ${SUPABASE_ADMIN_PASSWORD}
+      DB_NAME: ${DB_NAME}
+      DB_AFTER_CONNECT_QUERY: SET search_path TO _realtime
+      DB_ENC_KEY: ${DB_ENC_KEY}
+      API_JWT_SECRET: ${JWT_SECRET}
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE}
+      ERL_AFLAGS: -proto_dist inet_tcp
+      DNS_NODES: "''"
+      RLIMIT_NOFILE: '10000'
+      APP_NAME: realtime
+      SEED_SELF_HOST: 'true'
+      RUN_JANITOR: 'true'
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------
+  # storage-api — the avatars / flow-media / chat-media buckets.
+  #
+  # Local disk, not S3. The bytes live in the `storage-data` volume;
+  # backup.sh tars it alongside the nightly pg_dump. Moving to S3
+  # later means swapping the three STORAGE_* vars back to the AWS
+  # stack's values and attaching an instance profile — the database
+  # rows do not change.
+  # ---------------------------------------------------------------
+  storage:
+    image: supabase/storage-api:${STORAGE_VERSION:-v1.25.7}
+    restart: unless-stopped
+    environment:
+      ANON_KEY: ${SUPABASE_ANON_KEY}
+      SERVICE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}
+      POSTGREST_URL: http://rest:3000
+      PGRST_JWT_SECRET: ${JWT_SECRET}
+      AUTH_JWT_SECRET: ${JWT_SECRET}
+      DATABASE_URL: postgres://supabase_storage_admin:${SUPABASE_STORAGE_ADMIN_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
+      # 000_bootstrap.sql already created every role. Letting
+      # storage-api try again fails — it is not a superuser here.
+      DB_INSTALL_ROLES: 'false'
+      # Outer gate. The per-bucket limits the app's migrations set on
+      # storage.buckets (16 MB for chat-media) are the tighter ones.
+      FILE_SIZE_LIMIT: ${STORAGE_FILE_SIZE_LIMIT:-52428800}
+
+      STORAGE_BACKEND: file
+      FILE_STORAGE_BACKEND_PATH: /var/lib/storage
+      # Legacy name for the same path — storage-api renamed this
+      # between releases and reads whichever it knows.
+      STORAGE_FILE_BACKEND_PATH: /var/lib/storage
+
+      TENANT_ID: stub
+      ENABLE_IMAGE_TRANSFORMATION: 'false'
+    volumes:
+      - storage-data:/var/lib/storage
+    depends_on:
+      rest:
+        condition: service_started
+      db:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------
+  # The CRM.
+  #
+  # Built on the box. NEXT_PUBLIC_* values are inlined into the
+  # client bundle at build time, so changing SUPABASE_PUBLIC_URL or
+  # APP_URL requires `deploy.sh --rebuild`, not just a restart. That
+  # is why the instance needs a fixed Elastic IP: those URLs contain
+  # it, and a new IP means a full rebuild.
+  # ---------------------------------------------------------------
+  app:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_SUPABASE_URL: ${SUPABASE_PUBLIC_URL}
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
+        NEXT_PUBLIC_SITE_URL: ${APP_URL}
+        NEXT_PUBLIC_APP_LOCALE: ${APP_LOCALE:-en}
+    restart: unless-stopped
+    ports:
+      - '3000:3000'
+    environment:
+      NODE_ENV: production
+      PORT: '3000'
+      HOSTNAME: 0.0.0.0
+
+      NEXT_PUBLIC_SUPABASE_URL: ${SUPABASE_PUBLIC_URL}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
+      NEXT_PUBLIC_SITE_URL: ${APP_URL}
+      NEXT_PUBLIC_APP_LOCALE: ${APP_LOCALE:-en}
+
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      META_APP_SECRET: ${META_APP_SECRET}
+      META_APP_ID: ${META_APP_ID}
+      AUTOMATION_CRON_SECRET: ${AUTOMATION_CRON_SECRET}
+      ALLOWED_INVITE_HOSTS: ${APP_FQDN}
+    depends_on:
+      kong:
+        condition: service_started
+
+volumes:
+  db-data:
+  storage-data:

@@ -55,3 +55,7 @@ deploy/aws/terraform/*.tfvars
 deploy/aws/terraform/tfplan
 # Generated on the instance by deploy.sh from Secrets Manager.
 deploy/aws/stack/.env
+
+# Single-instance deployment (deploy/selfhost). Generated on the box
+# by deploy.sh from /etc/wacrm/secrets.json.
+deploy/selfhost/.env

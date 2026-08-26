@@ -1,0 +1,28 @@
+# Brings the Compose stack back after a reboot.
+#
+# Deliberately NOT deploy.sh: a reboot should restart containers, not
+# re-run migrations or rebuild the image. Those are things you do on
+# purpose, by running deploy.sh yourself.
+#
+# The .env file deploy.sh wrote persists on disk, so `compose up`
+# has everything it needs.
+
+[Unit]
+Description=wacrm + self-hosted Supabase (single instance)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/wacrm/src/deploy/selfhost
+ExecStart=/usr/bin/docker compose up -d
+ExecStop=/usr/bin/docker compose stop
+# Postgres has to finish crash recovery before the services that
+# depend on it will start; the healthcheck in docker-compose.yml
+# gates them, but give the first attempt room on a slow boot.
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,214 @@
+# =================================================================
+# Kong declarative config.
+#
+# `$SUPABASE_ANON_KEY` / `$SUPABASE_SERVICE_KEY` are expanded by the
+# container entrypoint (see docker-compose.yml) before Kong parses
+# this. Kong itself does not read environment variables in
+# declarative config.
+#
+# Route layout mirrors hosted Supabase exactly, because the client
+# library hard-codes these paths:
+#
+#   /auth/v1/*      -> GoTrue
+#   /rest/v1/*      -> PostgREST
+#   /realtime/v1/*  -> Realtime  (WebSocket)
+#   /storage/v1/*   -> storage-api
+# =================================================================
+_format_version: '2.1'
+_transform: true
+
+# ---------------------------------------------------------------
+# Consumers
+#
+# The two API keys. `key-auth` matches the `apikey` header (and the
+# `apikey` query parameter, which is how the Realtime WebSocket
+# presents it — a browser cannot set headers on a WS handshake).
+# ---------------------------------------------------------------
+consumers:
+  - username: anon
+    keyauth_credentials:
+      - key: $SUPABASE_ANON_KEY
+  - username: service_role
+    keyauth_credentials:
+      - key: $SUPABASE_SERVICE_KEY
+
+acls:
+  - consumer: anon
+    group: anon
+  - consumer: service_role
+    group: admin
+
+services:
+  # -------------------------------------------------------------
+  # Unauthenticated GoTrue routes.
+  #
+  # These are reached by a browser following a link in an email, or
+  # by an OAuth provider redirecting back. Neither can attach an
+  # apikey header, so they must sit outside key-auth.
+  # -------------------------------------------------------------
+  - name: auth-v1-open
+    url: http://auth:9999/verify
+    routes:
+      - name: auth-v1-open
+        strip_path: true
+        paths:
+          - /auth/v1/verify
+    plugins:
+      - name: cors
+
+  - name: auth-v1-open-callback
+    url: http://auth:9999/callback
+    routes:
+      - name: auth-v1-open-callback
+        strip_path: true
+        paths:
+          - /auth/v1/callback
+    plugins:
+      - name: cors
+
+  - name: auth-v1-open-authorize
+    url: http://auth:9999/authorize
+    routes:
+      - name: auth-v1-open-authorize
+        strip_path: true
+        paths:
+          - /auth/v1/authorize
+    plugins:
+      - name: cors
+
+  # Exists purely for the ALB target group health check. An ALB
+  # health check cannot send custom headers, so every key-auth
+  # protected route would answer 401 and the target would never come
+  # into service. GoTrue's /health returns only version metadata.
+  - name: auth-v1-open-health
+    url: http://auth:9999/health
+    routes:
+      - name: auth-v1-open-health
+        strip_path: true
+        paths:
+          - /auth/v1/health
+    plugins:
+      - name: cors
+
+  # -------------------------------------------------------------
+  # Everything else on /auth/v1 — signup, token, user, logout, ...
+  # -------------------------------------------------------------
+  - name: auth-v1
+    _comment: 'GoTrue: /auth/v1/* -> http://auth:9999/*'
+    url: http://auth:9999/
+    routes:
+      - name: auth-v1-all
+        strip_path: true
+        paths:
+          - /auth/v1/
+    plugins:
+      - name: cors
+      - name: key-auth
+        config:
+          # GoTrue reads the apikey header itself in some code paths,
+          # so it must survive the plugin.
+          hide_credentials: false
+      - name: acl
+        config:
+          hide_groups_header: true
+          allow:
+            - admin
+            - anon
+
+  # -------------------------------------------------------------
+  # PostgREST
+  # -------------------------------------------------------------
+  - name: rest-v1
+    _comment: 'PostgREST: /rest/v1/* -> http://rest:3000/*'
+    url: http://rest:3000/
+    routes:
+      - name: rest-v1-all
+        strip_path: true
+        paths:
+          - /rest/v1/
+    plugins:
+      - name: cors
+      - name: key-auth
+        config:
+          # PostgREST authorises from the Authorization bearer token,
+          # not from apikey. Stripping it here keeps the anon key out
+          # of upstream logs.
+          hide_credentials: true
+      - name: acl
+        config:
+          hide_groups_header: true
+          allow:
+            - admin
+            - anon
+
+  # -------------------------------------------------------------
+  # Realtime — WebSocket.
+  #
+  # Note the upstream host name. Kong rewrites the Host header to the
+  # upstream's hostname, and Realtime reads the first label of that
+  # (`realtime-dev`) as its tenant id. This is why the container_name
+  # in docker-compose.yml is what it is.
+  # -------------------------------------------------------------
+  - name: realtime-v1-ws
+    _comment: 'Realtime: /realtime/v1/* -> ws://realtime-dev.supabase-realtime:4000/socket/*'
+    url: http://realtime-dev.supabase-realtime:4000/socket
+    protocol: http
+    routes:
+      - name: realtime-v1-ws
+        strip_path: true
+        paths:
+          - /realtime/v1/
+    plugins:
+      - name: cors
+      - name: key-auth
+        config:
+          hide_credentials: false
+      - name: acl
+        config:
+          hide_groups_header: true
+          allow:
+            - admin
+            - anon
+
+  - name: realtime-v1-rest
+    _comment: 'Realtime REST API'
+    url: http://realtime-dev.supabase-realtime:4000/api
+    protocol: http
+    routes:
+      - name: realtime-v1-rest
+        strip_path: true
+        paths:
+          - /realtime/v1/api
+    plugins:
+      - name: cors
+      - name: key-auth
+        config:
+          hide_credentials: false
+      - name: acl
+        config:
+          hide_groups_header: true
+          allow:
+            - admin
+            - anon
+
+  # -------------------------------------------------------------
+  # Storage.
+  #
+  # Deliberately NOT behind key-auth. The three buckets are public
+  # (migrations 008 / 016 / 023 set public = true) and Meta fetches
+  # outbound media straight off
+  #   /storage/v1/object/public/<bucket>/<path>
+  # with no credentials of any kind. storage-api enforces the RLS
+  # policies on storage.objects for every non-public path itself,
+  # using the Authorization bearer token.
+  # -------------------------------------------------------------
+  - name: storage-v1
+    _comment: 'storage-api: /storage/v1/* -> http://storage:5000/*'
+    url: http://storage:5000/
+    routes:
+      - name: storage-v1-all
+        strip_path: true
+        paths:
+          - /storage/v1/
+    plugins:
+      - name: cors
