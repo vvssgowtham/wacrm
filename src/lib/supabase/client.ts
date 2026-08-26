@@ -1,4 +1,5 @@
 import { createBrowserClient } from '@supabase/ssr'
+import { SUPABASE_COOKIE_NAME } from './cookie-name'
 import type { SupabaseClient } from '@supabase/supabase-js'
 
 // Singleton instance — one client shared across the whole browser session.
@@ -11,7 +12,8 @@ export function createClient() {
 
   browserClient = createBrowserClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    { cookieOptions: { name: SUPABASE_COOKIE_NAME } }
   )
 
   return browserClient

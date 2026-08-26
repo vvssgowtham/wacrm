@@ -1,5 +1,6 @@
 import { createServerClient } from '@supabase/ssr'
 import { supabaseApiUrl } from '@/lib/supabase/api-url'
+import { SUPABASE_COOKIE_NAME } from '@/lib/supabase/cookie-name'
 import { NextResponse, type NextRequest } from 'next/server'
 
 export async function middleware(request: NextRequest) {
@@ -9,6 +10,7 @@ export async function middleware(request: NextRequest) {
     supabaseApiUrl(),
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
     {
+      cookieOptions: { name: SUPABASE_COOKIE_NAME },
       cookies: {
         getAll() {
           return request.cookies.getAll()

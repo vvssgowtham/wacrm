@@ -1,5 +1,6 @@
 import { createServerClient } from '@supabase/ssr'
 import { supabaseApiUrl } from './api-url'
+import { SUPABASE_COOKIE_NAME } from './cookie-name'
 import { cookies } from 'next/headers'
 
 export async function createClient() {
@@ -9,6 +10,7 @@ export async function createClient() {
     supabaseApiUrl(),
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
     {
+      cookieOptions: { name: SUPABASE_COOKIE_NAME },
       cookies: {
         getAll() {
           return cookieStore.getAll()
